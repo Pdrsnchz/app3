@@ -71,8 +71,8 @@ SPY_CACHE_TTL = 300
 SPY_RVOL_DELAY_SEC = 6
 SPY_RVOL_START_HOUR = 10  # primer cálculo válido (hora NY)
 
-# path caché 1H SPY
-SPY_1H_CACHE_PATH = CACHE_DIR / "SPY__1H.pkl"
+# path caché 30M SPY (usado para cálculo SPY RVol cada 30m)
+SPY_30M_CACHE_PATH = CACHE_DIR / "SPY__30M.pkl"
 
 # ========== SHARED STATE ==========
 latest_results = {
@@ -238,12 +238,14 @@ def map_corr_to_color(corr):
     if c > -0.75: return "#ff7b7b"
     return "#b20000"
 
-# ==== SPY 1H cache helpers ====
-def load_spy_1h_cache() -> pd.DataFrame:
-    if not os.path.exists(SPY_1H_CACHE_PATH):
+# ==== SPY 30 min cache helpers ====
+def load_spy_30m_cache() -> pd.DataFrame:
+    """Carga el pkl de SPY 30min desde disco (normaliza TZ)."""
+    path = SPY_30M_CACHE_PATH
+    if not os.path.exists(path):
         return pd.DataFrame()
     try:
-        with open(SPY_1H_CACHE_PATH, "rb") as f:
+        with open(path, "rb") as f:
             df = pickle.load(f)
         if isinstance(df, pd.DataFrame) and not df.empty:
             if isinstance(df.index, pd.DatetimeIndex):
@@ -256,10 +258,10 @@ def load_spy_1h_cache() -> pd.DataFrame:
     except Exception:
         return pd.DataFrame()
 
-def save_spy_1h_cache(df: pd.DataFrame):
+def save_spy_30m_cache(df: pd.DataFrame):
     """
-    Guarda en disco el DataFrame pasado y actualiza spy_rvol_state['last_ts'] con
-    la última timestamp conocida (tz-aware, NY).
+    Guarda en disco el DataFrame 30m pasado y actualiza spy_rvol_state['last_ts']
+    con la última timestamp conocida (tz-aware, NY).
     """
     try:
         if df is None:
@@ -281,44 +283,40 @@ def save_spy_1h_cache(df: pd.DataFrame):
             except Exception:
                 spy_rvol_state["last_ts"] = None
         else:
-            # si df2 está vacío, limpiar last_ts
             spy_rvol_state["last_ts"] = None
 
-        with open(SPY_1H_CACHE_PATH, "wb") as f:
+        with open(SPY_30M_CACHE_PATH, "wb") as f:
             pickle.dump(df2, f)
     except Exception:
-        # no elevar excepción en la escritura de caché para no romper el worker
         pass
 
-def update_spy_1h_cache(loop, ib, spy_contract, end_dt: datetime | None = None):
+def update_spy_30m_cache(loop, ib, spy_contract, end_dt: datetime | None = None):
     """
-    Pide hasta 2H de barras 1H ending en end_dt (si se pasa) y guarda sólo la(s)
-    barra(s) nuevas en el cache on-disk SPY__1H.pkl. Devuelve el dataframe completo cacheado.
-
-    - end_dt: datetime aware en TZ_NY indicando el 'endDateTime' deseado (última vela cerrada).
-              Si es None, se usa el comportamiento por defecto (now) — pero NUNCA deberías
-              llamar sin pasar end_dt cuando quieras la última vela cerrada.
+    Pide hasta 2H de barras 30 mins ending en end_dt (si se pasa) y guarda sólo la(s)
+    barra(s) nuevas en el cache on-disk SPY__30M.pkl. Devuelve el dataframe completo cacheado.
+    - end_dt: datetime aware en TZ_NY indicando el 'endDateTime' deseado (última vela cerrada 30m).
     """
     # preparar string endDateTime para la API de IB (formato YYYYMMDD HH:MM:SS, zona NY)
     if end_dt is not None:
         end_ny = end_dt.astimezone(TZ_NY)
         end_str = end_ny.strftime("%Y%m%d %H:%M:%S")
     else:
-        end_str = ""  # fallback (preferible pasar end_dt siempre)
+        end_str = ""
 
     try:
+        # pedimos 2 H en barras de 30 mins (normalmente devuelve 4 barras)
         bars = loop.run_until_complete(ib.reqHistoricalDataAsync(
-            spy_contract, end_str, "2 H", "1 hour", "TRADES", useRTH=True, formatDate=1
+            spy_contract, end_str, "2 H", "30 mins", "TRADES", useRTH=True, formatDate=1
         ))
     except Exception:
         bars = None
 
     if not bars:
-        return load_spy_1h_cache()
+        return load_spy_30m_cache()
 
     df_new = util.df(bars)
     if df_new.empty:
-        return load_spy_1h_cache()
+        return load_spy_30m_cache()
 
     # normalizar timestamp -> índice (NY TZ)
     if "date" in df_new.columns:
@@ -336,35 +334,31 @@ def update_spy_1h_cache(loop, ib, spy_contract, end_dt: datetime | None = None):
             idx = idx.tz_convert(TZ_NY)
         df_new.index = idx
     else:
-        return load_spy_1h_cache()
+        return load_spy_30m_cache()
 
     df_new.index.name = "datetime"
     df_new = df_new[~df_new.index.duplicated(keep="last")].sort_index()
 
-    # tomamos únicamente la última barra del bloque solicitado (la barra cerrada que pedimos)
+    # tomamos únicamente la última barra cerrada del bloque solicitado
     last_bar = df_new.iloc[[-1]]
 
     # cargar caché on-disk actual
-    df_cache = load_spy_1h_cache()
+    df_cache = load_spy_30m_cache()
     if df_cache is None or df_cache.empty:
         df_cache = last_bar
     else:
-        # si la última barra del fetch ya está presente o es anterior o igual, evitamos añadirla
         try:
             last_cache_ts = df_cache.index.max()
             last_bar_ts = last_bar.index.max()
             if last_bar_ts <= last_cache_ts:
-                # nada nuevo que añadir
                 return df_cache
         except Exception:
-            # en caso de cualquier error temporal, seguimos con concat/dedupe
             pass
 
-        # concat y dedupe por índice: así construimos un histórico incremental persistente
         df_cache = pd.concat([df_cache, last_bar])
         df_cache = df_cache[~df_cache.index.duplicated(keep="last")].sort_index()
 
-    save_spy_1h_cache(df_cache)
+    save_spy_30m_cache(df_cache)
     return df_cache
 
 # ========== HELPERS PARA AUDITORÍA RVol ==========
@@ -588,18 +582,15 @@ def get_rvol_components(df_agg: pd.DataFrame):
         return None
 
 
-def get_spy_hourly_components(df_1h: pd.DataFrame, lookback_days: int):
+def get_spy_30m_components(df_30m: pd.DataFrame, lookback_days: int):
     """
-    Extrae (rvol, current_cum, prior_cums, avg_prior, bar_ts) para SPY 1H.
-    Si para un día previo no existe la vela exactamente a `current_hour`, busca
-    retrocediendo hasta encontrar un día con esa misma hora. Evita reutilizar
-    la misma fecha sustituta más de una vez.
+    Extrae (rvol, current_cum, prior_cums, avg_prior, bar_ts) para SPY 30m.
     Devuelve None si no es posible.
     """
     try:
-        if df_1h is None or df_1h.empty:
+        if df_30m is None or df_30m.empty:
             return None
-        df = df_1h.copy()
+        df = df_30m.copy()
         if isinstance(df.index, pd.DatetimeIndex):
             idx = pd.to_datetime(df.index)
             if idx.tz is None:
@@ -611,74 +602,33 @@ def get_spy_hourly_components(df_1h: pd.DataFrame, lookback_days: int):
             return None
 
         df = df.sort_index()
+
+        # ignorar la última fila (vela en formación)
+        if len(df) <= 1:
+            return None
+        df = df.iloc[:-1]
+
         current_ts = df.index.max()
         current_day = current_ts.date()
-        current_hour = current_ts.time()
+        current_slot = current_ts.time()
 
-        # acumulado HOY hasta current_hour
         today_df = df[df.index.date == current_day]
-        today_df = today_df[today_df.index.time <= current_hour]
+        today_df = today_df[today_df.index.time <= current_slot]
         if today_df.empty:
             return None
 
         current_cum = float(today_df["volume"].sum())
         bar_ts = today_df.index.max()
 
-        # todos los días anteriores disponibles (orden cronológico asc)
-        prior_days_all = sorted({d for d in df.index.date if d < current_day})
-        if not prior_days_all:
-            return None
-
-        # tomamos la ventana nominal de días más recientes a considerar
-        candidate_window = prior_days_all[-lookback_days:] if len(prior_days_all) >= lookback_days else prior_days_all[:]
-
+        prior_days = sorted({d for d in df.index.date if d < current_day})
+        prior_days = prior_days[-lookback_days:]
         prior_cums = []
-        used_dates = set()
+        for d in prior_days:
+            d_df = df[df.index.date == d]
+            d_df = d_df[d_df.index.time <= current_slot]
+            if not d_df.empty:
+                prior_cums.append(float(d_df["volume"].sum()))
 
-        # helper: devuelve cumulative hasta current_hour en 'day' si existe vela en esa hora
-        def cum_for_day(day):
-            day_df = df[df.index.date == day]
-            if day_df.empty:
-                return None
-            # debe existir una vela en la hora exacta para considerarlo válido
-            if any(t == current_hour for t in day_df.index.time):
-                return float(day_df[day_df.index.time <= current_hour]["volume"].sum())
-            return None
-
-        # procesamos desde el día más cercano hacia atrás
-        for d in reversed(candidate_window):
-            # intentar usar d o, si no tiene la hora, buscar hacia atrás en prior_days_all
-            found = False
-            # índice en prior_days_all
-            try:
-                pos = prior_days_all.index(d)
-            except ValueError:
-                pos = None
-
-            # primero probar el propio día d
-            cum = cum_for_day(d)
-            if cum is not None and d not in used_dates:
-                prior_cums.append(cum)
-                used_dates.add(d)
-                found = True
-            else:
-                # buscar día anterior no usada que sí tenga la vela en current_hour
-                if pos is not None:
-                    for j in range(pos - 1, -1, -1):
-                        cand = prior_days_all[j]
-                        if cand in used_dates:
-                            continue
-                        cum_cand = cum_for_day(cand)
-                        if cum_cand is not None:
-                            prior_cums.append(cum_cand)
-                            used_dates.add(cand)
-                            found = True
-                            break
-            # si no se encuentra ninguno, simplemente saltar (no duplicar)
-            if len(prior_cums) >= lookback_days:
-                break
-
-        # requisitos mínimos
         if len(prior_cums) < MIN_PRIOR_DAYS_FOR_RVOL:
             return None
 
@@ -749,16 +699,15 @@ def compute_rvol_from_df(df_agg: pd.DataFrame):
         return None
     return current_cum / avg_prior
     
-def compute_spy_rvol_hourly(df_1h: pd.DataFrame, lookback_days: int) -> float | None:
+def compute_spy_rvol_30m(df_30m: pd.DataFrame, lookback_days: int) -> float | None:
     """
-    Replica EXACTA de la lógica PineScript 'Relative Volume at Time'
-    usando barras de 1H.
+    Igual que compute_spy_rvol_hourly pero con barras de 30 minutos.
+    Importante: IGNORA SIEMPRE la última fila recibida (vela en formación).
     """
-
-    if df_1h is None or df_1h.empty:
+    if df_30m is None or df_30m.empty:
         return None
 
-    df = df_1h.copy()
+    df = df_30m.copy()
 
     # asegurar datetime index NY
     if isinstance(df.index, pd.DatetimeIndex):
@@ -773,31 +722,34 @@ def compute_spy_rvol_hourly(df_1h: pd.DataFrame, lookback_days: int) -> float | 
 
     df = df.sort_index()
 
-    # día y hora actual (última barra cerrada)
+    # ignorar la última fila (vela en formación)
+    if len(df) <= 1:
+        return None
+    df = df.iloc[:-1]
+
+    # día y slot actual (última vela CERRADA)
     current_ts = df.index.max()
     current_day = current_ts.date()
-    current_hour = current_ts.time()
+    current_slot = current_ts.time()
 
-    # volumen acumulado HOY hasta current_hour
+    # volumen acumulado HOY hasta current_slot
     today_df = df[df.index.date == current_day]
-    today_df = today_df[today_df.index.time <= current_hour]
-
+    today_df = today_df[today_df.index.time <= current_slot]
     if today_df.empty:
         return None
 
-    current_cum = today_df["volume"].sum()
+    current_cum = float(today_df["volume"].sum())
 
     # días anteriores
     prior_days = sorted({d for d in df.index.date if d < current_day})
     prior_days = prior_days[-lookback_days:]
 
     prior_cums = []
-
     for d in prior_days:
         d_df = df[df.index.date == d]
-        d_df = d_df[d_df.index.time <= current_hour]
+        d_df = d_df[d_df.index.time <= current_slot]
         if not d_df.empty:
-            prior_cums.append(d_df["volume"].sum())
+            prior_cums.append(float(d_df["volume"].sum()))
 
     if len(prior_cums) < MIN_PRIOR_DAYS_FOR_RVOL:
         return None
@@ -928,29 +880,35 @@ def populate_from_disk_cache():
                         latest_results[t][tf]["corr"] = None
                         latest_results[t][tf]["bgcolor"] = "white"
 
-    # --- Load SPY 1H cache (if exists) so hourly RVol can use it immediately ---
-    df_spy_1h = load_spy_1h_cache()
-    if df_spy_1h is not None and not df_spy_1h.empty:
+    # --- Load SPY 30M cache (if exists) so SPY RVol can use it immediately ---
+    df_spy_30m = load_spy_30m_cache()
+    if df_spy_30m is not None and not df_spy_30m.empty:
         try:
-            cutoff = datetime.now(pytz.utc).astimezone(TZ_NY).replace(minute=0, second=0, microsecond=0)
-            df_trim = df_spy_1h[df_spy_1h.index <= cutoff]
+            # cutoff = último borde de 30m (hora/minuto par) actual
+            now_cut = datetime.now(pytz.utc).astimezone(TZ_NY)
+            # normalizamos a borde (min 0 o 30)
+            cut_min = 30 if now_cut.minute >= 30 else 0
+            cutoff = now_cut.replace(minute=cut_min, second=0, microsecond=0)
+
+            # quedarnos con barras hasta cutoff y siempre ignorando la última fila en formación
+            df_trim = df_spy_30m[df_spy_30m.index <= cutoff]
             if not df_trim.empty:
-                spy_rvol_state["Q"]  = compute_spy_rvol_hourly(df_trim, 60)
-                spy_rvol_state["M"]  = compute_spy_rvol_hourly(df_trim, 20)
-                spy_rvol_state["2W"] = compute_spy_rvol_hourly(df_trim, 10)
-                spy_rvol_state["1W"] = compute_spy_rvol_hourly(df_trim, 5)
+                # compute for each lookback using 30m bars (function ignores last row internally)
+                spy_rvol_state["Q"]  = compute_spy_rvol_30m(df_trim, 60)
+                spy_rvol_state["M"]  = compute_spy_rvol_30m(df_trim, 20)
+                spy_rvol_state["2W"] = compute_spy_rvol_30m(df_trim, 10)
+                spy_rvol_state["1W"] = compute_spy_rvol_30m(df_trim, 5)
                 spy_rvol_state["last_date"] = cutoff.date()
                 spy_rvol_state["last_hour"] = int(cutoff.hour)
                 spy_rvol_state["last_update"] = datetime.now(TZ_NY).strftime("%Y-%m-%d %H:%M:%S")
-                # guardamos el timestamp de la última barra usada (tz-aware)
                 spy_rvol_state["last_ts"] = df_trim.index.max()
 
-                # audit log for SPY initial (if possible)
+                # audit log for SPY initial (if possible) using 30m helper
                 try:
-                    sp_comps = get_spy_hourly_components(df_trim, 60)
+                    sp_comps = get_spy_30m_components(df_trim, 60)
                     if sp_comps is not None:
                         r_q, curr_q, hist_q, avg_q, ts_q = sp_comps
-                        log_rvol_to_csv("SPY", "1H_init_Q", ts_q, curr_q, hist_q, avg_q, r_q)
+                        log_rvol_to_csv("SPY", "30M_init_Q", ts_q, curr_q, hist_q, avg_q, r_q)
                 except Exception:
                     pass
         except Exception:
@@ -1046,11 +1004,11 @@ def ib_worker():
             progress["processed"] += 1
             continue
 
-        # primary attempt: 8 days (RTH) -> más margen para sesiones parciales/feriados
-        bars = safe_req_hist(cmap[t], "8 D", "15 mins", useRTH=True, retries=3, pause=0.15)
-        # fallback: try 9 days if 8D returned nothing
+        # primary attempt: 7 days (RTH) -> más margen para sesiones parciales/feriados
+        bars = safe_req_hist(cmap[t], "7 D", "15 mins", useRTH=True, retries=3, pause=0.15)
+        # fallback: try 8 days if 8D returned nothing
         if not bars:
-            bars = safe_req_hist(cmap[t], "9 D", "15 mins", useRTH=True, retries=2, pause=0.15)
+            bars = safe_req_hist(cmap[t], "8 D", "15 mins", useRTH=True, retries=2, pause=0.15)
 
         if bars:
             df_new = util.df(bars)
@@ -1114,32 +1072,32 @@ def ib_worker():
             spy_cache[tf] = {"df": df_comb, "ts": _time.time()}
             save_disk_cache(COMPARE_WITH, tf, df_comb)
 
-    # SPY 1H initial: if no cache, fetch full 65D 1H (only once at startup)
-    df_spy_1h_cache = load_spy_1h_cache()
-    if df_spy_1h_cache is None or df_spy_1h_cache.empty:
-        bars_1h_full = safe_req_hist(spy_contract, "65 D", "1 hour", useRTH=True, retries=3, pause=0.2)
-        if bars_1h_full:
-            df1h = util.df(bars_1h_full)
-            if "date" in df1h.columns:
-                df1h["date"] = pd.to_datetime(df1h["date"])
-                if df1h["date"].dt.tz is None:
-                    df1h["date"] = df1h["date"].dt.tz_localize(TZ_NY)
+    # SPY 30M initial: si no hay cache, fetch full 65D en 30m (solo una vez al startup)
+    df_spy_30m_cache = load_spy_30m_cache()
+    if df_spy_30m_cache is None or df_spy_30m_cache.empty:
+        bars_30m_full = safe_req_hist(spy_contract, "65 D", "30 mins", useRTH=True, retries=3, pause=0.2)
+        if bars_30m_full:
+            df30 = util.df(bars_30m_full)
+            if "date" in df30.columns:
+                df30["date"] = pd.to_datetime(df30["date"])
+                if df30["date"].dt.tz is None:
+                    df30["date"] = df30["date"].dt.tz_localize(TZ_NY)
                 else:
-                    df1h["date"] = df1h["date"].dt.tz_convert(TZ_NY)
-                df1h.set_index("date", inplace=True)
-            elif isinstance(df1h.index, pd.DatetimeIndex):
-                idx = pd.to_datetime(df1h.index)
+                    df30["date"] = df30["date"].dt.tz_convert(TZ_NY)
+                df30.set_index("date", inplace=True)
+            elif isinstance(df30.index, pd.DatetimeIndex):
+                idx = pd.to_datetime(df30.index)
                 if idx.tz is None:
                     idx = idx.tz_localize(TZ_NY)
                 else:
                     idx = idx.tz_convert(TZ_NY)
-                df1h.index = idx
-            df1h.index.name = "datetime"
-            df1h = df1h[~df1h.index.duplicated(keep="last")].sort_index()
-            save_spy_1h_cache(df1h)
-            df_spy_1h_cache = df1h
+                df30.index = idx
+            df30.index.name = "datetime"
+            df30 = df30[~df30.index.duplicated(keep="last")].sort_index()
+            save_spy_30m_cache(df30)
+            df_spy_30m_cache = df30
     else:
-        df_spy_1h_cache = df_spy_1h_cache
+        df_spy_30m_cache = df_spy_30m_cache
 
     # Now RRS for tickers that passed RVol filter (initial)
     for t in TICKERS:
@@ -1357,12 +1315,12 @@ def ib_worker():
                 now_ny_local2 = datetime.now(pytz.utc).astimezone(TZ_NY)
                 end_dt_15m = floor_to_tf(now_ny_local2, tf_seconds_15m) - pd.Timedelta(seconds=tf_seconds_15m)
 
-                # pedir 8 días por defecto para tener +2 sesiones de margen (feriados/media jornada)
-                bars_15m = safe_req_hist(cmap[t], "8 D", "15 mins", useRTH=True, retries=2, pause=0.12, end_dt=end_dt_15m)
+                # pedir 7 días por defecto para tener +1 sesiones de margen (feriados/media jornada)
+                bars_15m = safe_req_hist(cmap[t], "7 D", "15 mins", useRTH=True, retries=2, pause=0.12, end_dt=end_dt_15m)
 
                 if not bars_15m:
-                    # fallback a 9 días si 8D falla
-                    bars_15m = safe_req_hist(cmap[t], "9 D", "15 mins", useRTH=True, retries=1, pause=0.12, end_dt=end_dt_15m)
+                    # fallback a 8 días si 7D falla
+                    bars_15m = safe_req_hist(cmap[t], "8 D", "15 mins", useRTH=True, retries=1, pause=0.12, end_dt=end_dt_15m)
 
                 if not bars_15m:
                     # si no hay datos, contamos como procesado y seguimos
@@ -1426,14 +1384,17 @@ def ib_worker():
 
         _time.sleep(0.8)
         
-        # ===== SPY RVOL HOURLY (cache incremental 1H) =====
+        # ===== SPY RVOL 30M (cache incremental 30min), recalcula en xx:00 y xx:30 =====
         now_ny = datetime.now(pytz.utc).astimezone(TZ_NY)
 
+        # sólo empezamos a calcular a partir de SPY_RVOL_START_HOUR
         if now_ny.hour >= SPY_RVOL_START_HOUR:
-            cutoff = now_ny.replace(minute=0, second=0, microsecond=0)
+            # normalizamos a borde de 30m (0 o 30)
+            cut_min = 30 if now_ny.minute >= 30 else 0
+            cutoff = now_ny.replace(minute=cut_min, second=0, microsecond=0)
 
-            # comprobar caché on-disk: si está por debajo de cutoff, forzamos fetch inmediatamente
-            df_on_disk = load_spy_1h_cache()
+            # comprobar caché on-disk: si está por debajo de cutoff, forzamos fetch/compute
+            df_on_disk = load_spy_30m_cache()
             last_cache_ts = None
             if isinstance(df_on_disk, pd.DataFrame) and not df_on_disk.empty:
                 last_cache_ts = df_on_disk.index.max()
@@ -1455,73 +1416,41 @@ def ib_worker():
                 need_compute = True
 
             if need_compute:
-                # si estamos exactamente en hh:00 esperar SPY_RVOL_DELAY_SEC segundos para que IB publique la barra 1H cerrada
-                if now_ny.minute == 0 and now_ny.second < SPY_RVOL_DELAY_SEC:
+                # si estamos exactamente en hh:00 o hh:30 esperar SPY_RVOL_DELAY_SEC s para que IB publique la barra 30m cerrada
+                if now_ny.second < SPY_RVOL_DELAY_SEC and (now_ny.minute % 30 == 0):
                     pass
                 else:
-                    # update cache (1 petición corta) - esta función añade solo las barras nuevas al pkl
-                    # calcular end_dt = frontera anterior a la hora actual (última 1H cerrada)
+                    # calcular end_dt = frontera anterior de 30m (última 30m cerrada)
                     now_ny_for_spy = datetime.now(pytz.utc).astimezone(TZ_NY)
-                    cutoff = now_ny_for_spy.replace(minute=0, second=0, microsecond=0)
-                    end_dt_1h = cutoff - pd.Timedelta(hours=1)   # la hora iniciada anterior -> vela cerrada
+                    end_dt_30m = floor_to_tf(now_ny_for_spy, 30 * 60) - pd.Timedelta(minutes=30)
 
-                    # Si la caché on-disk no existe o está vacía, hacer un fetch completo de 65D (Q) para asegurar suficiente lookback
-                    df_on_disk = load_spy_1h_cache()
-                    if df_on_disk is None or df_on_disk.empty:
-                        bars_1h_full = safe_req_hist(spy_contract, "65 D", "1 hour", useRTH=True, retries=3, pause=0.3)
-                        if bars_1h_full:
-                            df1h = util.df(bars_1h_full)
-                            if "date" in df1h.columns:
-                                df1h["date"] = pd.to_datetime(df1h["date"])
-                                if df1h["date"].dt.tz is None:
-                                    df1h["date"] = df1h["date"].dt.tz_localize(TZ_NY)
-                                else:
-                                    df1h["date"] = df1h["date"].dt.tz_convert(TZ_NY)
-                                df1h.set_index("date", inplace=True)
-                            elif isinstance(df1h.index, pd.DatetimeIndex):
-                                idx = pd.to_datetime(df1h.index)
-                                if idx.tz is None:
-                                    idx = idx.tz_localize(TZ_NY)
-                                else:
-                                    idx = idx.tz_convert(TZ_NY)
-                                df1h.index = idx
-                            df1h.index.name = "datetime"
-                            df1h = df1h[~df1h.index.duplicated(keep="last")].sort_index()
-                            save_spy_1h_cache(df1h)
-                            df_1h_cache = df1h
-                        else:
-                            # si tampoco conseguimos el fetch completo, intentar la actualización incremental (más pequeña)
-                            df_1h_cache = update_spy_1h_cache(loop, ib, spy_contract, end_dt=end_dt_1h)
-                    else:
-                        # caché ya existe: intentar sólo añadir la(s) barra(s) nuevas (actual incremental)
-                        df_1h_cache = update_spy_1h_cache(loop, ib, spy_contract, end_dt=end_dt_1h)
+                    df_30m_cache = update_spy_30m_cache(loop, ib, spy_contract, end_dt=end_dt_30m)
 
-                    # cargar de nuevo caché on-disk por seguridad
-                    df_1h_cache = load_spy_1h_cache()
+                    # recargar cache por seguridad
+                    df_30m_cache = load_spy_30m_cache()
 
-                    if df_1h_cache is None or df_1h_cache.empty:
-                        # no datos, dejamos estado previo
+                    if df_30m_cache is None or df_30m_cache.empty:
                         pass
                     else:
-                        # quedarnos con barras hasta cutoff (última hora cerrada)
-                        df_trim = df_1h_cache[df_1h_cache.index <= cutoff]
+                        # quedarnos con barras hasta cutoff (última 30m cerrada)
+                        df_trim = df_30m_cache[df_30m_cache.index <= cutoff]
                         if df_trim.empty:
-                            # intentar con la hora anterior si corte no disponible
-                            df_trim = df_1h_cache[df_1h_cache.index <= (cutoff - pd.Timedelta(hours=1))]
+                            # intentar con la franja anterior si no disponible
+                            df_trim = df_30m_cache[df_30m_cache.index <= (cutoff - pd.Timedelta(minutes=30))]
 
                         if not df_trim.empty:
                             with state_lock:
-                                # obtener componentes y rvol para cada lookback y loguear
-                                res_q = get_spy_hourly_components(df_trim, 60)
-                                res_m = get_spy_hourly_components(df_trim, 20)
-                                res_2w = get_spy_hourly_components(df_trim, 10)
-                                res_1w = get_spy_hourly_components(df_trim, 5)
+                                # compute y log para cada lookback usando 30m bars (las funciones internas ignoran la fila en formación)
+                                res_q = get_spy_30m_components(df_trim, 60)
+                                res_m = get_spy_30m_components(df_trim, 20)
+                                res_2w = get_spy_30m_components(df_trim, 10)
+                                res_1w = get_spy_30m_components(df_trim, 5)
 
                                 if res_q is not None:
                                     q, q_curr, q_hist, q_avg, q_ts = res_q
                                     spy_rvol_state["Q"] = round(q, 2)
                                     try:
-                                        log_rvol_to_csv("SPY", "1H_Q", q_ts, q_curr, q_hist, q_avg, q)
+                                        log_rvol_to_csv("SPY", "30M_Q", q_ts, q_curr, q_hist, q_avg, q)
                                     except Exception:
                                         pass
                                 else:
@@ -1531,7 +1460,7 @@ def ib_worker():
                                     m, m_curr, m_hist, m_avg, m_ts = res_m
                                     spy_rvol_state["M"] = round(m, 2)
                                     try:
-                                        log_rvol_to_csv("SPY", "1H_M", m_ts, m_curr, m_hist, m_avg, m)
+                                        log_rvol_to_csv("SPY", "30M_M", m_ts, m_curr, m_hist, m_avg, m)
                                     except Exception:
                                         pass
                                 else:
@@ -1541,7 +1470,7 @@ def ib_worker():
                                     w2, w2_curr, w2_hist, w2_avg, w2_ts = res_2w
                                     spy_rvol_state["2W"] = round(w2, 2)
                                     try:
-                                        log_rvol_to_csv("SPY", "1H_2W", w2_ts, w2_curr, w2_hist, w2_avg, w2)
+                                        log_rvol_to_csv("SPY", "30M_2W", w2_ts, w2_curr, w2_hist, w2_avg, w2)
                                     except Exception:
                                         pass
                                 else:
@@ -1551,7 +1480,7 @@ def ib_worker():
                                     w1, w1_curr, w1_hist, w1_avg, w1_ts = res_1w
                                     spy_rvol_state["1W"] = round(w1, 2)
                                     try:
-                                        log_rvol_to_csv("SPY", "1H_1W", w1_ts, w1_curr, w1_hist, w1_avg, w1)
+                                        log_rvol_to_csv("SPY", "30M_1W", w1_ts, w1_curr, w1_hist, w1_avg, w1)
                                     except Exception:
                                         pass
                                 else:
@@ -1560,7 +1489,6 @@ def ib_worker():
                                 # registrar la hora/fecha de la barra usada para el cálculo
                                 spy_rvol_state["last_hour"] = int(df_trim.index.max().hour)
                                 spy_rvol_state["last_date"] = df_trim.index.max().date()
-                                # timestamp legible (puedes cambiar zona si quieres mostrar CET)
                                 spy_rvol_state["last_update"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # ====================================================
 
