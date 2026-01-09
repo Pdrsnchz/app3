@@ -76,7 +76,13 @@ SPY_30M_CACHE_PATH = CACHE_DIR / "SPY__30M.pkl"
 
 # ========== SHARED STATE ==========
 latest_results = {
-    t: {tf: {"RRS": None, "corr": None, "bgcolor": "white"} for tf in TIMEFRAMES} | {"RVol": None}
+    t: {
+        # por timeframe: RRS, corr, color y meta (últimos valores usados)
+        **{tf: {"RRS": None, "corr": None, "bgcolor": "white", "meta": {"last_ts": None, "last_close_sym": None, "last_close_spy": None}} for tf in TIMEFRAMES},
+        # RVol y metadatos
+        "RVol": None,
+        "RVol_meta": {"last_ts": None, "bar_ts": None, "prior_cums": [], "avg_prior": None, "current_cum": None}
+    }
     for t in TICKERS
 }
 state_lock = threading.Lock()
@@ -237,6 +243,134 @@ def map_corr_to_color(corr):
     if c > -0.50: return "#f29b9b"
     if c > -0.75: return "#ff7b7b"
     return "#b20000"
+
+# == Toltip data ==
+def build_ticker_tooltip(ticker: str) -> str:
+    """
+    Tooltip multiline string with the exact layout requested.
+
+    Line 1:
+      RVol: [rvol] , [HH:MM] , TS: [HH:MM:SS]
+    Line 2:
+      value1 | value2 | value3 | value4 | value5
+    Line 3: (blank)
+    Line 4:
+      RRS 1M: [YYYY-MM-DD HH:MM], [last_close_sym], [last_close_spy], TS [HH:MM:SS]
+    Line 5:
+      RRS 5M: ...
+    Line 6:
+      RRS 15M: ...
+    """
+    try:
+        st = latest_results.get(ticker, {}) or {}
+
+        # --- RVol block ---
+        rvol = st.get("RVol")
+        rvol_meta = st.get("RVol_meta") or st.get("rvol_meta") or {}  # accept several possible keys
+        # try multiple key names for bar_ts / request ts used elsewhere
+        bar_ts = rvol_meta.get("bar_ts") or rvol_meta.get("bar_ts_ts") or rvol_meta.get("bar_timestamp")
+        req_ts = rvol_meta.get("req_ts") or rvol_meta.get("calc_ts") or rvol_meta.get("timestamp") or rvol_meta.get("last_calc_ts")
+        prior = rvol_meta.get("prior_cums") or rvol_meta.get("prior") or rvol_meta.get("historical_values") or []
+
+        def _fmt_hm(dt):
+            try:
+                if dt is None:
+                    return "--"
+                if isinstance(dt, (int, float)):
+                    # epoch seconds
+                    dt = datetime.fromtimestamp(float(dt), tz=TZ_NY)
+                if isinstance(dt, str):
+                    dt = pd.to_datetime(dt)
+                if dt.tzinfo is None:
+                    dt = dt.tz_localize(TZ_NY)
+                else:
+                    dt = dt.astimezone(TZ_NY)
+                return dt.strftime("%H:%M")
+            except Exception:
+                return "--"
+
+        def _fmt_hms(dt):
+            try:
+                if dt is None:
+                    return "--"
+                if isinstance(dt, (int, float)):
+                    dt = datetime.fromtimestamp(float(dt), tz=TZ_NY)
+                if isinstance(dt, str):
+                    dt = pd.to_datetime(dt)
+                if dt.tzinfo is None:
+                    dt = dt.tz_localize(TZ_NY)
+                else:
+                    dt = dt.astimezone(TZ_NY)
+                return dt.strftime("%H:%M:%S")
+            except Exception:
+                return "--"
+
+        def _fmt_date_hm(dt):
+            try:
+                if dt is None:
+                    return "--"
+                if isinstance(dt, (int, float)):
+                    dt = datetime.fromtimestamp(float(dt), tz=TZ_NY)
+                if isinstance(dt, str):
+                    dt = pd.to_datetime(dt)
+                if dt.tzinfo is None:
+                    dt = dt.tz_localize(TZ_NY)
+                else:
+                    dt = dt.astimezone(TZ_NY)
+                return dt.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                return "--"
+
+        rvol_str = f"{rvol:.2f}" if (rvol is not None and not pd.isna(rvol)) else "--"
+        bar_hm = _fmt_hm(bar_ts)
+        req_hms = _fmt_hms(req_ts)
+
+        # prepare prior list: show up to 5 values, pipe-separated, preserve numeric formatting
+        try:
+            prior_list = list(prior)[:5]
+            prior_strs = [f"{float(x):.2f}" if (x is not None and x != "" and not pd.isna(x)) else "--" for x in prior_list]
+        except Exception:
+            # fallback: try mapping str
+            prior_strs = [str(x) for x in (prior or [])][:5]
+
+        # ensure exactly up to 5 values shown (if fewer, show those)
+        prior_line = " | ".join(prior_strs) if prior_strs else "--"
+
+        lines = []
+        lines.append(f"RVol: {rvol_str} , {bar_hm} , TS: {req_hms}")
+        lines.append(prior_line)
+        lines.append("")  # blank line
+
+        # --- RRS blocks for each TF in the requested order 1M,5M,15M ---
+        for tf_key in ("1M", "5M", "15M"):
+            tf_obj = st.get(tf_key) or {}
+            # support both patterns: tf_obj may contain "meta" dict or direct keys
+            meta = tf_obj.get("meta") or tf_obj.get("meta_tf") or {}
+            # fallback to top-level keys if present
+            last_ts_tf = meta.get("last_ts") or tf_obj.get("last_ts") or meta.get("bar_ts")
+            last_close_sym = meta.get("last_close_sym") or tf_obj.get("last_close_sym") or tf_obj.get("last_close")
+            last_close_spy = meta.get("last_close_spy") or tf_obj.get("last_close_spy") or tf_obj.get("last_close_spy_val") or None
+            # optionally there may be a calc/request ts in meta
+            tf_req_ts = meta.get("req_ts") or meta.get("calc_ts") or tf_obj.get("calc_ts") or None
+
+            # format values
+            bar_dt_str = _fmt_date_hm(last_ts_tf)  # YYYY-MM-DD HH:MM as requested for bar
+            sym_close_str = (
+                f"{float(last_close_sym):.2f}" if (last_close_sym is not None and last_close_sym != "" and not pd.isna(last_close_sym))
+                else "--"
+            )
+            spy_close_str = (
+                f"{float(last_close_spy):.2f}" if (last_close_spy is not None and last_close_spy != "" and not pd.isna(last_close_spy))
+                else "--"
+            )
+            tf_req_hms = _fmt_hms(tf_req_ts)
+
+            # rrs value (we include it at start of tf line? spec does not require it; keep label 'RRS {tf}:' then the fields)
+            lines.append(f"RRS {tf_key}: {bar_dt_str}, {sym_close_str}, {spy_close_str}, TS {tf_req_hms}")
+
+        return "\n".join(lines)
+    except Exception:
+        return "No data"
 
 # ==== SPY 30 min cache helpers ====
 def load_spy_30m_cache() -> pd.DataFrame:
@@ -898,19 +1032,86 @@ def populate_from_disk_cache():
     for t in TICKERS:
         for tf in TIMEFRAMES:
             df = load_disk_cache(t, tf)
+
             if df is not None:
                 disk_cache[(t, tf)] = df
-                if spy_cache[tf]["df"] is not None:
-                    rrs, corr = compute_rrs_and_corr(df, spy_cache[tf]["df"])
-                    with state_lock:
-                        latest_results[t][tf]["RRS"] = rrs
-                        latest_results[t][tf]["corr"] = corr
-                        latest_results[t][tf]["bgcolor"] = map_corr_to_color(corr)
+
+                spy_df = None
+                if tf in spy_cache and isinstance(spy_cache[tf], dict):
+                    spy_df = spy_cache[tf].get("df")
+
+                if spy_df is not None:
+                    rrs, corr = compute_rrs_and_corr(df, spy_df)
+
+                    # -------- audit log RRS / corr (INITIAL FROM DISK) --------
+                    try:
+                        path_rrs = LOG_DIR / f"{t}_rrs.csv"
+                        write_header = not path_rrs.exists()
+                        with open(path_rrs, "a", newline="", encoding="utf-8") as frrs:
+                            w = csv.writer(frrs)
+                            if write_header:
+                                w.writerow([
+                                    "timestamp", "phase", "tf",
+                                    "rrs", "corr",
+                                    "last_close_sym", "last_close_spy"
+                                ])
+
+                            last_close_sym = (
+                                df["close"].iloc[-1]
+                                if ("close" in df.columns and not df.empty)
+                                else None
+                            )
+
+                            try:
+                                last_close_spy = (
+                                    spy_df.reindex(df.index)["close"].iloc[-1]
+                                    if ("close" in spy_df.columns and not spy_df.empty)
+                                    else None
+                                )
+                            except Exception:
+                                last_close_spy = (
+                                    spy_df["close"].iloc[-1]
+                                    if ("close" in spy_df.columns and not spy_df.empty)
+                                    else None
+                                )
+
+                            w.writerow([
+                                datetime.now(TZ_NY).strftime("%Y-%m-%d %H:%M:%S"),
+                                "initial_disk",
+                                tf,
+                                rrs,
+                                corr,
+                                last_close_sym,
+                                last_close_spy
+                            ])
+                    except Exception:
+                        pass
+                    # ----------------------------------------------------------
+
+                    # -------- guardar metadata para hover --------
+                    try:
+                        last_ts_tf = df.index.max() if not df.empty else None
+
+                        with state_lock:
+                            latest_results[t][tf]["RRS"] = rrs
+                            latest_results[t][tf]["corr"] = corr
+                            latest_results[t][tf]["bgcolor"] = map_corr_to_color(corr)
+                            latest_results[t][tf]["meta"] = {
+                                "last_ts": last_ts_tf,
+                                "last_close_sym": last_close_sym,
+                                "last_close_spy": last_close_spy,
+                            }
+                    except Exception:
+                        pass
+                    # ---------------------------------------------
+
                 else:
                     with state_lock:
                         latest_results[t][tf]["RRS"] = None
                         latest_results[t][tf]["corr"] = None
                         latest_results[t][tf]["bgcolor"] = "white"
+                        latest_results[t][tf]["meta"] = {}
+
             else:
                 # ensure placeholders exist so later logic doesn't KeyError
                 if (t, tf) not in disk_cache:
@@ -919,6 +1120,7 @@ def populate_from_disk_cache():
                         latest_results[t][tf]["RRS"] = None
                         latest_results[t][tf]["corr"] = None
                         latest_results[t][tf]["bgcolor"] = "white"
+                        latest_results[t][tf]["meta"] = {}
 
     # --- Load SPY 30M cache (if exists) so SPY RVol can use it immediately ---
     df_spy_30m = load_spy_30m_cache()
@@ -1028,8 +1230,23 @@ def ib_worker():
         if skip_fetch:
             df_comb = cached_rvol
             rvol = compute_rvol_from_df(df_comb)
+
+            # collect components for audit/tooltip
+            comps = None
+            try:
+                comps = get_rvol_components(df_comb)  # (current_cum, prior_cums, avg_prior, bar_ts)
+            except Exception:
+                comps = None
+
             with state_lock:
                 latest_results[t]["RVol"] = round(rvol, 2) if rvol is not None else None
+                latest_results[t]["RVol_meta"] = {
+                    "last_ts": (df_comb.index.max() if (isinstance(df_comb, pd.DataFrame) and not df_comb.empty) else None),
+                    "bar_ts": (comps[3] if comps else None),
+                    "prior_cums": (comps[1] if comps else []),
+                    "avg_prior": (comps[2] if comps else None),
+                    "current_cum": (comps[0] if comps else None)
+                }
 
             # audit log: extraer componentes y guardar
             comps = get_rvol_components(df_comb)
@@ -1072,8 +1289,23 @@ def ib_worker():
             save_disk_cache(t, "RVOL_15M", df_comb)
 
             rvol = compute_rvol_from_df(df_comb)
+
+            # collect components for audit/tooltip
+            comps = None
+            try:
+                comps = get_rvol_components(df_comb)  # (current_cum, prior_cums, avg_prior, bar_ts)
+            except Exception:
+                comps = None
+
             with state_lock:
                 latest_results[t]["RVol"] = round(rvol, 2) if rvol is not None else None
+                latest_results[t]["RVol_meta"] = {
+                    "last_ts": (df_comb.index.max() if (isinstance(df_comb, pd.DataFrame) and not df_comb.empty) else None),
+                    "bar_ts": (comps[3] if comps else None),
+                    "prior_cums": (comps[1] if comps else []),
+                    "avg_prior": (comps[2] if comps else None),
+                    "current_cum": (comps[0] if comps else None)
+                }
         else:
             # ensure placeholder to avoid repeated expensive retries and keep cache consistent
             if (t, "RVOL_15M") not in disk_cache:
@@ -1179,24 +1411,47 @@ def ib_worker():
                 spy_df = spy_cache[tf]["df"] if spy_cache[tf]["df"] is not None else disk_cache.get((COMPARE_WITH, tf))
                 if spy_df is not None:
                     rrs, corr = compute_rrs_and_corr(df_comb, spy_df)
-                    with state_lock:
-                        # --- audit log: RRS / corr (initial) ---
-                        try:
-                            path_rrs = LOG_DIR / f"{t}_rrs.csv"
-                            write_header = not path_rrs.exists()
-                            with open(path_rrs, "a", newline="", encoding="utf-8") as frrs:
-                                w = csv.writer(frrs)
-                                if write_header:
-                                    w.writerow(["timestamp", "phase", "tf", "rrs", "corr", "last_close_sym", "last_close_spy"])
-                                last_close_sym = df_comb["close"].iloc[-1] if "close" in df_comb.columns and not df_comb.empty else ""
+
+                    # --- audit log: RRS / corr (incremental) ---
+                    try:
+                        path_rrs = LOG_DIR / f"{t}_rrs.csv"
+                        write_header = not path_rrs.exists()
+                        with open(path_rrs, "a", newline="", encoding="utf-8") as frrs:
+                            w = csv.writer(frrs)
+                            if write_header:
+                                w.writerow(["timestamp", "phase", "tf", "rrs", "corr", "last_close_sym", "last_close_spy"])
+                            last_close_sym = df_comb["close"].iloc[-1] if "close" in df_comb.columns and not df_comb.empty else ""
+                            try:
                                 last_close_spy = spy_df.reindex(df_comb.index)["close"].iloc[-1] if (isinstance(spy_df, pd.DataFrame) and "close" in spy_df.columns and not spy_df.empty) else ""
-                                w.writerow([datetime.now(TZ_NY).strftime("%Y-%m-%d %H:%M:%S"), "initial", tf, rrs, corr, last_close_sym, last_close_spy])
-                        except Exception:
-                            pass
-                    
-                        latest_results[t][tf]["RRS"] = rrs
-                        latest_results[t][tf]["corr"] = corr
-                        latest_results[t][tf]["bgcolor"] = map_corr_to_color(corr)
+                            except Exception:
+                                last_close_spy = (spy_df["close"].iloc[-1] if (isinstance(spy_df, pd.DataFrame) and "close" in spy_df.columns and not spy_df.empty) else "")
+                            w.writerow([datetime.now(TZ_NY).strftime("%Y-%m-%d %H:%M:%S"), "incremental", tf_key, rrs, corr, last_close_sym, last_close_spy])
+                    except Exception:
+                        pass
+
+                    # store results + metadata for tooltip/audit
+                    try:
+                        last_ts_tf = (df_comb.index.max() if (isinstance(df_comb, pd.DataFrame) and not df_comb.empty) else None)
+                        last_close_sym = (df_comb["close"].iloc[-1] if ("close" in df_comb.columns and not df_comb.empty) else None)
+                        last_close_spy = None
+                        if isinstance(spy_df, pd.DataFrame) and not spy_df.empty:
+                            try:
+                                last_close_spy = spy_df.reindex(df_comb.index)["close"].iloc[-1]
+                            except Exception:
+                                last_close_spy = (spy_df["close"].iloc[-1] if "close" in spy_df.columns else None)
+
+                        with state_lock:
+                            latest_results[t][tf_key]["RRS"] = rrs
+                            latest_results[t][tf_key]["corr"] = corr
+                            latest_results[t][tf_key]["bgcolor"] = map_corr_to_color(corr)
+                            latest_results[t][tf_key]["meta"] = {
+                                "last_ts": last_ts_tf,
+                                "last_close_sym": last_close_sym,
+                                "last_close_spy": last_close_spy
+                            }
+                    except Exception:
+                        # no romper flujo por fallo de logging/metadata
+                        pass
             else:
                 # placeholder to avoid repeated attempts
                 if (t, tf) not in disk_cache:
@@ -1317,20 +1572,47 @@ def ib_worker():
                 if spy_df is None:
                     continue
                 rrs, corr = compute_rrs_and_corr(df_comb, spy_df)
-                with state_lock:
-                    # --- audit log: RRS / corr (incremental) ---
-                    try:
-                        path_rrs = LOG_DIR / f"{t}_rrs.csv"
-                        write_header = not path_rrs.exists()
-                        with open(path_rrs, "a", newline="", encoding="utf-8") as frrs:
-                            w = csv.writer(frrs)
-                            if write_header:
-                                w.writerow(["timestamp", "phase", "tf", "rrs", "corr", "last_close_sym", "last_close_spy"])
-                            last_close_sym = df_comb["close"].iloc[-1] if "close" in df_comb.columns and not df_comb.empty else ""
+
+                # --- audit log: RRS / corr (incremental) ---
+                try:
+                    path_rrs = LOG_DIR / f"{t}_rrs.csv"
+                    write_header = not path_rrs.exists()
+                    with open(path_rrs, "a", newline="", encoding="utf-8") as frrs:
+                        w = csv.writer(frrs)
+                        if write_header:
+                            w.writerow(["timestamp", "phase", "tf", "rrs", "corr", "last_close_sym", "last_close_spy"])
+                        last_close_sym = df_comb["close"].iloc[-1] if "close" in df_comb.columns and not df_comb.empty else ""
+                        try:
                             last_close_spy = spy_df.reindex(df_comb.index)["close"].iloc[-1] if (isinstance(spy_df, pd.DataFrame) and "close" in spy_df.columns and not spy_df.empty) else ""
-                            w.writerow([datetime.now(TZ_NY).strftime("%Y-%m-%d %H:%M:%S"), "incremental", tf_key, rrs, corr, last_close_sym, last_close_spy])
-                    except Exception:
-                        pass
+                        except Exception:
+                            last_close_spy = (spy_df["close"].iloc[-1] if (isinstance(spy_df, pd.DataFrame) and "close" in spy_df.columns and not spy_df.empty) else "")
+                        w.writerow([datetime.now(TZ_NY).strftime("%Y-%m-%d %H:%M:%S"), "incremental", tf_key, rrs, corr, last_close_sym, last_close_spy])
+                except Exception:
+                    pass
+
+                # store results + metadata for tooltip/audit
+                try:
+                    last_ts_tf = (df_comb.index.max() if (isinstance(df_comb, pd.DataFrame) and not df_comb.empty) else None)
+                    last_close_sym = (df_comb["close"].iloc[-1] if ("close" in df_comb.columns and not df_comb.empty) else None)
+                    last_close_spy = None
+                    if isinstance(spy_df, pd.DataFrame) and not spy_df.empty:
+                        try:
+                            last_close_spy = spy_df.reindex(df_comb.index)["close"].iloc[-1]
+                        except Exception:
+                            last_close_spy = (spy_df["close"].iloc[-1] if "close" in spy_df.columns else None)
+
+                    with state_lock:
+                        latest_results[t][tf_key]["RRS"] = rrs
+                        latest_results[t][tf_key]["corr"] = corr
+                        latest_results[t][tf_key]["bgcolor"] = map_corr_to_color(corr)
+                        latest_results[t][tf_key]["meta"] = {
+                            "last_ts": last_ts_tf,
+                            "last_close_sym": last_close_sym,
+                            "last_close_spy": last_close_spy
+                        }
+                except Exception:
+                    # no romper flujo por fallo de logging/metadata
+                    pass
 
                     latest_results[t][tf_key]["RRS"] = rrs
                     latest_results[t][tf_key]["corr"] = corr
@@ -1388,8 +1670,23 @@ def ib_worker():
                 save_disk_cache(t, "RVOL_15M", df_comb)
 
                 rvol = compute_rvol_from_df(df_comb)
+
+                # collect components for audit/tooltip
+                comps = None
+                try:
+                    comps = get_rvol_components(df_comb)  # (current_cum, prior_cums, avg_prior, bar_ts)
+                except Exception:
+                    comps = None
+
                 with state_lock:
                     latest_results[t]["RVol"] = round(rvol, 2) if rvol is not None else None
+                    latest_results[t]["RVol_meta"] = {
+                        "last_ts": (df_comb.index.max() if (isinstance(df_comb, pd.DataFrame) and not df_comb.empty) else None),
+                        "bar_ts": (comps[3] if comps else None),
+                        "prior_cums": (comps[1] if comps else []),
+                        "avg_prior": (comps[2] if comps else None),
+                        "current_cum": (comps[0] if comps else None)
+                    }
 
                 # audit log: extraer componentes y guardar
                 comps = get_rvol_components(df_comb)
@@ -1630,6 +1927,10 @@ app.layout = html.Div([
         page_size=100,
         sort_action="native",
 
+        tooltip_delay=200,
+        tooltip_duration=None,   # None = muestra hasta que se vaya el mouse
+        # tooltip_data se rellenará desde el callback
+
         style_cell={
             "textAlign": "center",
             "backgroundColor": "transparent",
@@ -1704,12 +2005,14 @@ def update_columns_with_countdown(n):
 @app.callback(
     Output("table", "data"),
     Output("table", "style_data_conditional"),
+    Output("table", "tooltip_data"),
     Output("status", "children"),
     Input("refresh", "n_intervals")
 )
 def update(n):
     rows = []
     styles = []
+    tooltip_rows = []
     with state_lock:
         total = progress.get("total", 0)
         processed = progress.get("processed", 0)
@@ -1720,7 +2023,6 @@ def update(n):
             if rvol is None or rvol < RVOL_THRESHOLD:
                 continue
 
-            # ----- estrella para favoritos -----
             fav_prefix = "★ " if t in FAVORITES else ""
             ticker_display = f"{fav_prefix}{t}"
 
@@ -1745,7 +2047,6 @@ def update(n):
                     "color": "black"
                 })
 
-            # ----- estilo especial para favoritos -----
             if t in FAVORITES:
                 styles.append({
                     "if": {
@@ -1753,10 +2054,18 @@ def update(n):
                         "column_id": "Ticker"
                     },
                     "fontWeight": "bold",
-                    "color": "#FFD700"  # dorado
+                    "color": "#FFD700"
                 })
 
             rows.append(row)
+
+            # Tooltip only on the Ticker cell (you can expand to other cells if you want)
+            tooltip_text = build_ticker_tooltip(t)
+            tooltip_rows.append({
+                "Ticker": {"type": "text", "value": tooltip_text},
+                "RVol": {"type": "text", "value": ""},  # required shape for each column
+                **{f"RRS_{tf}": {"type": "text", "value": ""} for tf in TIMEFRAMES}
+            })
 
         if not ready:
             status_text = f"Updating initial cache: {processed}/{total} tasks completed..."
@@ -1765,7 +2074,7 @@ def update(n):
             status_text = f"Data ready (last full update: {last_full_update})"
             status_color = "green"
 
-    return rows, styles, html.Span(status_text, style={"color": status_color})
+    return rows, styles, tooltip_rows, html.Span(status_text, style={"color": status_color})
 
 # ========== SPY_RVol UPDATE CALLBACK ==========
 @app.callback(
